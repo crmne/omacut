@@ -24,6 +24,8 @@ class Backend : public QObject {
     Q_PROPERTY(QVariantList videos READ videoList NOTIFY videosChanged)
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
     Q_PROPERTY(bool probing READ probing NOTIFY busyChanged)
+    // A recorded take is being measured, and isn't on the timeline yet.
+    Q_PROPERTY(bool measuring READ measuring NOTIFY busyChanged)
     Q_PROPERTY(QString status READ status NOTIFY statusChanged)
     Q_PROPERTY(QString themeAccent READ themeAccent NOTIFY themeAccentChanged)
     Q_PROPERTY(QString themeAccentForeground READ themeAccentForeground NOTIFY themeAccentChanged)
@@ -37,10 +39,12 @@ public:
 
     QUrl source() const { return m_videos.isEmpty() ? QUrl() : m_videos.first().url; }
     QVariantList videoList() const;
-    // Busy while exporting or while a probe is in flight: either way the
-    // set of videos is about to change, so opening or adding must wait.
-    bool busy() const { return m_busy || m_probing; }
+    // Busy while exporting, while a probe is in flight, or while a take is
+    // measured: the set of videos or the edit is about to change, so
+    // opening, adding or exporting must wait.
+    bool busy() const { return m_busy || m_probing || m_measuring > 0; }
     bool probing() const { return m_probing; }
+    bool measuring() const { return m_measuring > 0; }
     QString status() const { return m_status; }
     QString themeAccent() const { return m_themeAccent; }
     QString themeAccentForeground() const;
@@ -163,6 +167,7 @@ private:
     edit::Voiceovers m_exportDialogVoiceovers;
     bool m_busy = false;
     bool m_probing = false;
+    int m_measuring = 0;
     QList<PendingVideo> m_probeQueue;
     int m_nextBatch = 0;
     int m_batchAdded = 0;

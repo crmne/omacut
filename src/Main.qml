@@ -32,8 +32,9 @@ ApplicationWindow {
 
     readonly property var timeline: backend.timeline
     // Quitting only warns about unexported edits. One clip spanning the whole
-    // first video is never dirty — that's just the source.
-    readonly property bool unexported: hasVideo && timeline.unexported
+    // first video is never dirty — that's just the source. A take still
+    // being measured is an edit too.
+    readonly property bool unexported: hasVideo && (timeline.unexported || backend.measuring)
     // Editing shortcuts go quiet while a dialog or the help overlay is up,
     // a probe is about to replace the timeline, a handle is dragged, or a
     // voiceover is being recorded.
@@ -931,12 +932,15 @@ ApplicationWindow {
             spacing: 10
 
             IconButton {
+                objectName: "playButton"
                 Layout.preferredWidth: 44
                 Layout.preferredHeight: 44
                 iconName: player.playbackState === MediaPlayer.PlayingState && !player.priming ? "pause" : "play"
                 tipText: player.playbackState === MediaPlayer.PlayingState ? "Pause" : "Play"
                 enabled: timeline.duration > 0
-                onClicked: togglePlay()
+                // Pausing alone would leave the microphone running, and
+                // whatever's said after resuming lands late in the take.
+                onClicked: win.recording ? stopRecording() : togglePlay()
             }
 
             ColumnLayout {

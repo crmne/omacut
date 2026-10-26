@@ -18,4 +18,6 @@ cd "$BUILD_DIR"
 
 "$QMAKE" "$ROOT/tests/backend_tests.pro"
 make
-./backend_tests
+# Offscreen, so the QML tests never put windows up on the desktop. Set
+# QT_QPA_PLATFORM to watch them on a real display instead.
+QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}" ./backend_tests

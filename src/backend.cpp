@@ -460,12 +460,19 @@ void Backend::addVoiceover(const QUrl &url, double t) {
     if (path.isEmpty() || source.isEmpty())
         return;
     // Like a video probe, off the UI thread, and dropped if the backend is
-    // gone or another video was opened meanwhile.
+    // gone. Until it's on the timeline the backend is busy, so the take
+    // can't be left out of an export or lost to another video.
+    ++m_measuring;
+    emit busyChanged();
     const QPointer<Backend> guard(this);
     QThreadPool::globalInstance()->start([guard, path, source, t] {
         const double length = ffmpeg::audioDuration(path);
         QMetaObject::invokeMethod(QCoreApplication::instance(), [guard, path, source, t, length] {
-            if (!guard || guard->source() != source)
+            if (!guard)
+                return;
+            --guard->m_measuring;
+            emit guard->busyChanged();
+            if (guard->source() != source)
                 return;
             if (length <= 0.0)
                 emit guard->voiceoverFailed(QStringLiteral("Nothing was recorded."));

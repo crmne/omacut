@@ -2,8 +2,9 @@ import QtQuick
 
 // The voiceovers laid over the edit, in a lane under the clips, on the same
 // scale as the edit bar above it. Drag one to move it along the edit, click
-// it to go to its start, and hover it to remove it. While recording, the take
-// so far grows from where it began to the playhead.
+// it to go to its start, and hover it to remove it (a short take shows its ×
+// beside it). While recording, the take so far grows from where it began to
+// the playhead.
 Item {
     id: root
     implicitHeight: 26
@@ -50,38 +51,26 @@ Item {
             required property int index
             // Briefly past the end while the voiceover count changes.
             readonly property var voiceover: root.voiceovers[index] || { at: 0, end: 0, length: 0 }
-            readonly property bool removable: area.containsMouse && width > 50
+            readonly property bool hovered: area.containsMouse || removeArea.containsMouse
+            // Wide takes hold their × inside; narrow ones get it alongside,
+            // on whichever side the lane has room.
+            readonly property bool roomy: width > 50
             x: Math.round(root.bar.xForTime(voiceover.at))
             width: Math.max(6, Math.round(root.bar.xForTime(voiceover.end)) - x)
             height: root.height
             radius: root.frameRadius
             color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, area.pressed ? 0.45 : 0.28)
             border.color: root.accent; border.width: 2
-            z: area.pressed ? 1 : 0
+            z: area.pressed || hovered ? 1 : 0
 
             Text {
                 anchors.verticalCenter: parent.verticalCenter
                 anchors.left: parent.left; anchors.leftMargin: 8
-                anchors.right: parent.right; anchors.rightMargin: block.removable ? 28 : 8
+                anchors.right: parent.right; anchors.rightMargin: block.hovered ? 28 : 8
                 visible: block.width > 60
                 text: "Voiceover"
                 color: "white"; font.pixelSize: 11; font.weight: Font.DemiBold
                 elide: Text.ElideRight
-            }
-
-            Rectangle {
-                id: remove
-                visible: block.removable && !area.moved
-                anchors.verticalCenter: parent.verticalCenter
-                anchors.right: parent.right; anchors.rightMargin: 4
-                width: 18; height: 18; radius: 9
-                readonly property bool hot: area.onRemove
-                color: hot ? root.accent : "#e0202023"
-                Text {
-                    anchors.centerIn: parent; anchors.verticalCenterOffset: -1
-                    text: "×"; font.pixelSize: 14; font.weight: Font.DemiBold
-                    color: remove.hot ? root.accentForeground : "white"
-                }
             }
 
             MouseArea {
@@ -91,9 +80,7 @@ Item {
                 property real pressX: 0
                 property real pressAt: 0
                 property bool moved: false
-                readonly property bool onRemove: remove.visible && containsMouse
-                    && mouseX >= remove.x && mouseX <= remove.x + remove.width
-                cursorShape: onRemove ? Qt.PointingHandCursor : pressed && moved ? Qt.ClosedHandCursor : Qt.OpenHandCursor
+                cursorShape: pressed && moved ? Qt.ClosedHandCursor : Qt.OpenHandCursor
                 // Measured on the lane, which holds still while the block moves.
                 function laneX(mouse) { return mapToItem(root, mouse.x, 0).x }
 
@@ -101,10 +88,10 @@ Item {
                     pressX = laneX(mouse)
                     pressAt = block.voiceover.at
                     moved = false
-                    if (!onRemove) root.timeline.beginGesture()
+                    root.timeline.beginGesture()
                 }
                 onPositionChanged: mouse => {
-                    if (!pressed || onRemove) return
+                    if (!pressed) return
                     var x = laneX(mouse)
                     if (!moved && Math.abs(x - pressX) <= 4) return
                     moved = true
@@ -113,11 +100,33 @@ Item {
                 }
                 onReleased: {
                     root.timeline.endGesture()
-                    if (moved) return
-                    if (onRemove) root.timeline.removeVoiceover(block.index)
-                    else root.seek(block.voiceover.at)
+                    if (!moved) root.seek(block.voiceover.at)
                 }
                 onCanceled: root.timeline.endGesture()
+            }
+
+            Rectangle {
+                id: remove
+                objectName: "removeVoiceover"
+                visible: block.hovered && !area.pressed
+                readonly property bool fitsRight: block.x + block.width + width <= root.width
+                x: block.roomy ? block.width - width - 4
+                   : fitsRight ? block.width : -width
+                anchors.verticalCenter: parent.verticalCenter
+                width: 18; height: 18; radius: 9
+                color: removeArea.containsMouse ? root.accent : "#e0202023"
+                Text {
+                    anchors.centerIn: parent; anchors.verticalCenterOffset: -1
+                    text: "×"; font.pixelSize: 14; font.weight: Font.DemiBold
+                    color: removeArea.containsMouse ? root.accentForeground : "white"
+                }
+                MouseArea {
+                    id: removeArea
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.timeline.removeVoiceover(block.index)
+                }
             }
         }
     }

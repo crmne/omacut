@@ -128,6 +128,7 @@ class ShortcutBackend : public QObject {
     Q_PROPERTY(QVariantList videos READ videos NOTIFY videosChanged)
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
     Q_PROPERTY(bool probing READ probing NOTIFY busyChanged)
+    Q_PROPERTY(bool measuring READ measuring NOTIFY busyChanged)
     Q_PROPERTY(QString status READ status NOTIFY statusChanged)
     Q_PROPERTY(QString themeAccent READ themeAccent NOTIFY themeAccentChanged)
     Q_PROPERTY(QString themeAccentForeground READ themeAccentForeground NOTIFY themeAccentChanged)
@@ -145,6 +146,7 @@ public:
     QVariantList videos() const { return m_videos; }
     bool busy() const { return false; }
     bool probing() const { return false; }
+    bool measuring() const { return false; }
     QString status() const { return {}; }
     QString themeAccent() const { return QStringLiteral("#FFD60A"); }
     QString themeAccentForeground() const { return QStringLiteral("black"); }
@@ -225,6 +227,18 @@ static QQuickItem *dialogButton(QQuickWindow *window, const QString &text) {
     for (QQuickItem *item : items) {
         if (item->property("primary").isValid() && item->property("text").toString() == text)
             return item;
+    }
+    return nullptr;
+}
+
+// Repeater delegates aren't QObject children of the window, so this walks
+// the visual tree instead.
+static QQuickItem *findItem(QQuickItem *root, const QString &name) {
+    if (root->objectName() == name)
+        return root;
+    for (QQuickItem *child : root->childItems()) {
+        if (QQuickItem *found = findItem(child, name))
+            return found;
     }
     return nullptr;
 }
@@ -315,6 +329,7 @@ private slots:
     void qmlOpenConfirmsUnexportedEdit();
     void qmlHelpOverlayBlocksEditingKeys();
     void qmlRecordsAVoiceoverFromThePlayhead();
+    void qmlShortTakesCanBeRemoved();
     void timelineSplitsTrimsAndJoins();
     void timelineUndoesAGestureAsOneStep();
     void timelineTracksUnexportedCuts();
@@ -1185,8 +1200,12 @@ void BackendTests::addVoiceoverReadsTheTakesLength() {
     QVERIFY(backend.load(QUrl::fromLocalFile(video)));
     waitForProbe(backend);
 
+    // Busy until it's on the timeline, so nothing can export or open past it.
     backend.addVoiceover(QUrl::fromLocalFile(tone), 2.0);
+    QVERIFY(backend.measuring());
+    QVERIFY(backend.busy());
     QTRY_COMPARE_WITH_TIMEOUT(backend.timeline()->voiceovers().size(), 1, 10000);
+    QVERIFY(!backend.busy());
     const edit::Voiceover added = backend.timeline()->voiceovers().first();
     QCOMPARE(added.path, tone);
     QCOMPARE(added.at, 2.0);
@@ -1840,6 +1859,43 @@ void BackendTests::qmlRecordsAVoiceoverFromThePlayhead() {
     QCOMPARE(backend.recordedAt, 5.0);
     const double length = ffmpeg::audioDuration(backend.recordTo.toLocalFile());
     QVERIFY2(length > 0.5, qPrintable(QString::number(length)));
+
+    // The play/pause button stops a take too, rather than pausing the edit
+    // under a microphone that's still running.
+    backend.recordedUrl = QUrl();
+    QTest::keyClick(window, Qt::Key_R);
+    QTRY_VERIFY_WITH_TIMEOUT(window->property("recording").toBool(), 3000);
+    QTest::qWait(500);
+    auto *playButton = window->findChild<QQuickItem *>(QStringLiteral("playButton"));
+    QVERIFY(playButton);
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, itemCenter(playButton));
+    QTRY_VERIFY_WITH_TIMEOUT(!window->property("recording").toBool(), 5000);
+    QCOMPARE(backend.recordedUrl, backend.recordTo);
+}
+
+void BackendTests::qmlShortTakesCanBeRemoved() {
+    ShortcutBackend backend(placeholderUrl(m_dir), 600.0);
+    QmlHarness harness(backend);
+    QQuickWindow *window = showEditor(harness, backend);
+    QVERIFY2(window, qPrintable(mainQmlPath()));
+
+    // A fifth of a second over ten minutes: a sliver, too narrow for its ×.
+    backend.timeline.addVoiceover(QStringLiteral("/tmp/short-take.flac"), 300.0, 0.2);
+    QQuickItem *remove = nullptr;
+    QTRY_VERIFY_WITH_TIMEOUT(remove = findItem(window->contentItem(), QStringLiteral("removeVoiceover")), 3000);
+    QQuickItem *take = remove->parentItem();
+    QVERIFY(take->width() < 20);
+
+    // Hovering it shows the × beside it, and clicking that removes it.
+    // The lane lays out after the take appears, so aim at where it is now.
+    QVERIFY(QTest::qWaitFor([&] {
+        QTest::mouseMove(window, itemCenter(take));
+        return remove->isVisible();
+    }, 3000));
+    QVERIFY(remove->x() >= take->width() || remove->x() + remove->width() <= 0);
+    QTest::mouseMove(window, itemCenter(remove));
+    QTest::mouseClick(window, Qt::LeftButton, Qt::NoModifier, itemCenter(remove));
+    QTRY_VERIFY_WITH_TIMEOUT(backend.timeline.voiceovers().isEmpty(), 3000);
 }
 
 void BackendTests::qmlQuitConfirmsUnexportedEdit() {
