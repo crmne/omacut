@@ -8,7 +8,10 @@
 #include <QDragEnterEvent>
 #include <QDragLeaveEvent>
 #include <QDropEvent>
+#include <QAudioDevice>
+#include <QMediaDevices>
 #include <QMimeData>
+#include <QRegularExpression>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QImage>
@@ -160,6 +163,11 @@ public:
     Q_INVOKABLE QUrl suggestedExportUrl() const { return {}; }
     Q_INVOKABLE void saveFrame(double) {}
     Q_INVOKABLE bool addVideos(const QVariantList &, double) { return false; }
+    Q_INVOKABLE QUrl voiceoverUrl() const { return recordTo; }
+    Q_INVOKABLE void addVoiceover(const QUrl &url, double t) {
+        recordedUrl = url;
+        recordedAt = t;
+    }
 
     void announceInfo() {
         timeline.reset(m_duration);
@@ -182,6 +190,9 @@ public:
     int addCount = 0;
     double lastAddAt = -1;
     int exportCount = 0;
+    QUrl recordTo;
+    QUrl recordedUrl;
+    double recordedAt = -1;
 
 signals:
     void infoChanged();
@@ -193,6 +204,7 @@ signals:
     void exportFailed(const QString &message);
     void frameSaved(const QString &path);
     void frameFailed(const QString &message);
+    void voiceoverFailed(const QString &message);
     void loadError(const QString &message);
     void skippedVideos(int count);
 
@@ -274,6 +286,9 @@ private slots:
     void exportOddSizedWebmWritesEvenMp4();
     void exportKeepsOnlyTheClipsFromTheDialog();
     void exportJoinsDifferentVideos();
+    void exportMixesInVoiceovers();
+    void voiceoversAreRecordedBesideTheFirstVideo();
+    void addVoiceoverReadsTheTakesLength();
     void exportSkipsClipsWhoseVideoIsGone();
     void exportBlocksOpeningVideos();
     void exportClipCanReplaceSourceFile();
@@ -299,16 +314,19 @@ private slots:
     void qmlQuitConfirmsUnexportedEdit();
     void qmlOpenConfirmsUnexportedEdit();
     void qmlHelpOverlayBlocksEditingKeys();
+    void qmlRecordsAVoiceoverFromThePlayhead();
     void timelineSplitsTrimsAndJoins();
     void timelineUndoesAGestureAsOneStep();
     void timelineTracksUnexportedCuts();
     void timelineAddsAndMovesVideos();
     void timelineAnswersWhereTimesFall();
     void timelineEditsAtATime();
+    void timelineLaysVoiceoversOverTheEdit();
     void trimArgsReencodeForPreciseCuts();
     void trimArgsConcatenateTheRanges();
     void trimArgsFitDifferentVideosTogether();
     void trimArgsScaleTheShorterSide();
+    void trimArgsMixInVoiceovers();
     void exportHeightsNeverUpscale();
     void themeAccentReadsOmarchyColors();
     void themeAccentForegroundKeepsContrast();
@@ -324,6 +342,10 @@ private:
     // Probing finishes in the background now: wait until it has settled.
     void waitForProbe(Backend &backend);
     bool installBrokenFfmpeg(const QString &dirPath);
+    // A tone of the given length, as a recorded voiceover would be.
+    QString makeTone(const QString &name, double duration);
+    // The loudest sample, in dB, between from and from + length seconds.
+    double peakVolume(const QString &path, double from, double length);
 
     QTemporaryDir m_dir;
     QString m_videoPath;
@@ -369,6 +391,39 @@ QString BackendTests::formatName(const QString &path) const {
     if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0)
         return {};
     return QString::fromUtf8(proc.readAllStandardOutput()).trimmed();
+}
+
+QString BackendTests::makeTone(const QString &name, double duration) {
+    const QString path = m_dir.filePath(name);
+    QProcess proc;
+    proc.start(QStandardPaths::findExecutable(QStringLiteral("ffmpeg")), {
+        QStringLiteral("-hide_banner"), QStringLiteral("-loglevel"), QStringLiteral("error"),
+        QStringLiteral("-f"), QStringLiteral("lavfi"),
+        QStringLiteral("-i"), QStringLiteral("sine=frequency=440:duration=%1").arg(duration),
+        QStringLiteral("-y"), path,
+    });
+    if (!proc.waitForFinished(10000) || proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0)
+        return {};
+    return path;
+}
+
+double BackendTests::peakVolume(const QString &path, double from, double length) {
+    QProcess proc;
+    proc.start(QStandardPaths::findExecutable(QStringLiteral("ffmpeg")), {
+        QStringLiteral("-hide_banner"),
+        QStringLiteral("-ss"), QString::number(from), QStringLiteral("-t"), QString::number(length),
+        QStringLiteral("-i"), path,
+        QStringLiteral("-af"), QStringLiteral("volumedetect"),
+        QStringLiteral("-f"), QStringLiteral("null"), QStringLiteral("-"),
+    });
+    if (!proc.waitForFinished(10000))
+        return 0.0;
+    const QString log = QString::fromUtf8(proc.readAllStandardError());
+    const QRegularExpressionMatch match =
+        QRegularExpression(QStringLiteral("max_volume: (-?[0-9.]+|-inf) dB")).match(log);
+    if (!match.hasMatch() || match.captured(1) == QStringLiteral("-inf"))
+        return -1000.0;
+    return match.captured(1).toDouble();
 }
 
 // Drop an "ffmpeg" into dirPath that always fails to start (its shebang points
@@ -1067,6 +1122,84 @@ void BackendTests::exportJoinsDifferentVideos() {
     QVERIFY2(qAbs(info.duration - 3.0) < 0.2, qPrintable(QString::number(info.duration)));
 }
 
+void BackendTests::exportMixesInVoiceovers() {
+    // A silent video, so whatever is heard is the voiceover.
+    const QString video = makeVideo(QStringLiteral("voiced.mp4"), 3.0, false);
+    const QString tone = makeTone(QStringLiteral("voiced-voiceover.flac"), 0.5);
+    QVERIFY(!video.isEmpty() && !tone.isEmpty());
+
+    ThumbProvider provider;
+    auto *picker = new FakeFilePicker;
+    Backend backend(&provider, picker);
+    QSignalSpy doneSpy(&backend, &Backend::exportDone);
+    QSignalSpy failedSpy(&backend, &Backend::exportFailed);
+    QVERIFY(backend.load(QUrl::fromLocalFile(video)));
+    waitForProbe(backend);
+
+    Timeline *timeline = backend.timeline();
+    timeline->addVoiceover(tone, 1.0, 0.5);
+    QVERIFY(timeline->unexported());
+
+    // The export dialog takes the voiceovers along with the clips.
+    backend.exportDialog();
+    const QString outPath = m_dir.filePath(QStringLiteral("voiced-out.mp4"));
+    emit picker->exportSelected(QUrl::fromLocalFile(outPath), 0);
+    QTRY_VERIFY_WITH_TIMEOUT(doneSpy.count() + failedSpy.count() > 0, 20000);
+    QVERIFY2(failedSpy.isEmpty(), qPrintable(failedSpy.value(0).value(0).toString()));
+    QVERIFY(!timeline->unexported());
+
+    // Silence, then the tone from 1 s, and the video's length throughout.
+    const ffmpeg::VideoInfo info = ffmpeg::probe(outPath);
+    QVERIFY(info.ok);
+    QVERIFY(info.audio);
+    QVERIFY2(qAbs(info.duration - 3.0) < 0.2, qPrintable(QString::number(info.duration)));
+    QVERIFY(peakVolume(outPath, 0.0, 0.9) < -60.0);
+    QVERIFY(peakVolume(outPath, 1.1, 0.3) > -30.0);
+    QVERIFY(peakVolume(outPath, 1.7, 1.0) < -60.0);
+}
+
+void BackendTests::voiceoversAreRecordedBesideTheFirstVideo() {
+    ThumbProvider provider;
+    Backend backend(&provider, new FakeFilePicker);
+    QVERIFY(backend.voiceoverUrl().isEmpty());
+
+    const QString video = makeVideo(QStringLiteral("narrated.mp4"), 1.0, false);
+    QVERIFY(!video.isEmpty());
+    QVERIFY(backend.load(QUrl::fromLocalFile(video)));
+    waitForProbe(backend);
+
+    // Each take gets a name of its own, never one already taken.
+    QCOMPARE(backend.voiceoverUrl().toLocalFile(), m_dir.filePath(QStringLiteral("narrated-voiceover.flac")));
+    QVERIFY(!makeTone(QStringLiteral("narrated-voiceover.flac"), 0.2).isEmpty());
+    QCOMPARE(backend.voiceoverUrl().toLocalFile(), m_dir.filePath(QStringLiteral("narrated-voiceover-2.flac")));
+}
+
+void BackendTests::addVoiceoverReadsTheTakesLength() {
+    const QString video = makeVideo(QStringLiteral("take.mp4"), 4.0, false);
+    const QString tone = makeTone(QStringLiteral("take-voiceover.flac"), 1.5);
+    QVERIFY(!video.isEmpty() && !tone.isEmpty());
+
+    ThumbProvider provider;
+    Backend backend(&provider, new FakeFilePicker);
+    QSignalSpy failedSpy(&backend, &Backend::voiceoverFailed);
+    QVERIFY(backend.load(QUrl::fromLocalFile(video)));
+    waitForProbe(backend);
+
+    backend.addVoiceover(QUrl::fromLocalFile(tone), 2.0);
+    QTRY_COMPARE_WITH_TIMEOUT(backend.timeline()->voiceovers().size(), 1, 10000);
+    const edit::Voiceover added = backend.timeline()->voiceovers().first();
+    QCOMPARE(added.path, tone);
+    QCOMPARE(added.at, 2.0);
+    QVERIFY2(qAbs(added.length - 1.5) < 0.05, qPrintable(QString::number(added.length)));
+
+    // A take with nothing in it isn't laid over the edit.
+    const QString empty = m_dir.filePath(QStringLiteral("take-voiceover-2.flac"));
+    QFile(empty).open(QIODevice::WriteOnly);
+    backend.addVoiceover(QUrl::fromLocalFile(empty), 0.0);
+    QTRY_COMPARE_WITH_TIMEOUT(failedSpy.count(), 1, 10000);
+    QCOMPARE(backend.timeline()->voiceovers().size(), 1);
+}
+
 void BackendTests::exportClipCanReplaceSourceFile() {
     const QString sourcePath = m_dir.filePath(QStringLiteral("replace-source.mp4"));
     QVERIFY(QFile::copy(m_videoPath, sourcePath));
@@ -1681,6 +1814,34 @@ void BackendTests::qmlHelpOverlayBlocksEditingKeys() {
                               (edit::Clips{{0, 0.0, 1.0}, {0, 1.0, 20.0}}), 3000);
 }
 
+void BackendTests::qmlRecordsAVoiceoverFromThePlayhead() {
+    if (QMediaDevices::audioInputs().isEmpty())
+        QSKIP("No microphone to record from.");
+
+    ShortcutBackend backend(placeholderUrl(m_dir), 20.0);
+    backend.recordTo = QUrl::fromLocalFile(m_dir.filePath(QStringLiteral("recorded-voiceover.flac")));
+    QmlHarness harness(backend);
+    QQuickWindow *window = showEditor(harness, backend);
+    QVERIFY2(window, qPrintable(mainQmlPath()));
+
+    // R records from the playhead; editing waits until it stops.
+    QTest::keyClick(window, Qt::Key_Right, Qt::ShiftModifier);
+    QTRY_COMPARE_WITH_TIMEOUT(playhead(harness), 5.0, 3000);
+    QTest::keyClick(window, Qt::Key_R);
+    QTRY_VERIFY_WITH_TIMEOUT(window->property("recording").toBool(), 3000);
+    QTest::keyClick(window, Qt::Key_S);
+    QTest::qWait(1000);
+    QCOMPARE(backend.timeline.clips(), wholeVideo(20.0));
+
+    // R again stops it, and the take is laid where recording began.
+    QTest::keyClick(window, Qt::Key_R);
+    QTRY_VERIFY_WITH_TIMEOUT(!window->property("recording").toBool(), 5000);
+    QCOMPARE(backend.recordedUrl, backend.recordTo);
+    QCOMPARE(backend.recordedAt, 5.0);
+    const double length = ffmpeg::audioDuration(backend.recordTo.toLocalFile());
+    QVERIFY2(length > 0.5, qPrintable(QString::number(length)));
+}
+
 void BackendTests::qmlQuitConfirmsUnexportedEdit() {
     ShortcutBackend backend(placeholderUrl(m_dir), 20.0);
     QmlHarness harness(backend);
@@ -1916,6 +2077,55 @@ void BackendTests::timelineEditsAtATime() {
     QCOMPARE(timeline.clips().first(), (edit::Clip{0, 2.0, 2.0 + edit::minimumClip}));
 }
 
+void BackendTests::timelineLaysVoiceoversOverTheEdit() {
+    Timeline timeline;
+    timeline.reset(10.0);
+    QSignalSpy voiceoversSpy(&timeline, &Timeline::voiceoversChanged);
+
+    // A voiceover alone is an edit worth exporting.
+    timeline.addVoiceover(QStringLiteral("/tmp/vo.flac"), 2.0, 3.0);
+    QCOMPARE(timeline.voiceovers(), (edit::Voiceovers{{QStringLiteral("/tmp/vo.flac"), 2.0, 3.0}}));
+    QVERIFY(timeline.unexported());
+    QCOMPARE(voiceoversSpy.count(), 1);
+    const QVariantMap listed = timeline.voiceoverList().first().toMap();
+    QCOMPARE(listed.value(QStringLiteral("url")).toUrl(), QUrl::fromLocalFile(QStringLiteral("/tmp/vo.flac")));
+    QCOMPARE(listed.value(QStringLiteral("end")).toDouble(), 5.0);
+
+    // Clip edits leave voiceovers where they are, and don't announce them.
+    timeline.split(5.0);
+    QCOMPARE(voiceoversSpy.count(), 1);
+    QCOMPARE(timeline.voiceovers().first().at, 2.0);
+
+    // Moving keeps it starting inside the edit.
+    timeline.moveVoiceover(0, -4.0);
+    QCOMPARE(timeline.voiceovers().first().at, 0.0);
+    timeline.moveVoiceover(0, 30.0);
+    QCOMPARE(timeline.voiceovers().first().at, 10.0 - edit::minimumClip);
+
+    // A drag is one undo step, and undo brings removed voiceovers back.
+    timeline.beginGesture();
+    timeline.moveVoiceover(0, 1.0);
+    timeline.moveVoiceover(0, 1.5);
+    timeline.endGesture();
+    timeline.removeVoiceover(0);
+    QVERIFY(timeline.voiceovers().isEmpty());
+    timeline.undo();
+    QCOMPARE(timeline.voiceovers().first().at, 1.5);
+    timeline.undo();
+    QCOMPARE(timeline.voiceovers().first().at, 10.0 - edit::minimumClip);
+
+    // Exported with its voiceovers, the edit is saved until they change.
+    timeline.markExported(timeline.clips(), timeline.voiceovers());
+    QVERIFY(!timeline.unexported());
+    timeline.moveVoiceover(0, 3.0);
+    QVERIFY(timeline.unexported());
+
+    // A new video starts without any.
+    timeline.reset(10.0);
+    QVERIFY(timeline.voiceovers().isEmpty());
+    QVERIFY(!timeline.unexported());
+}
+
 void BackendTests::trimArgsReencodeForPreciseCuts() {
     const QStringList args = ffmpeg::trimArgs({{QStringLiteral("in.mp4"), 0.25, 0.75, true}},
                                               QStringLiteral("out.mp4"), 1920, 1080);
@@ -1995,6 +2205,33 @@ void BackendTests::trimArgsScaleTheShorterSide() {
     QCOMPARE(filterGraph(ffmpeg::trimArgs(segment, QStringLiteral("out.mp4"), 1920, 1080, 1080)),
              QStringLiteral("[0:V:0][0:a:0]concat=n=1:v=1:a=1[joined][a];"
                             "[joined]scale='if(gt(iw,ih),-2,1080)':'if(gt(iw,ih),1080,-2)'[v]"));
+}
+
+void BackendTests::trimArgsMixInVoiceovers() {
+    const QList<ffmpeg::Voiceover> voiceovers = {{QStringLiteral("vo1.flac"), 1.5},
+                                                 {QStringLiteral("vo2.flac"), 0.0}};
+    const QStringList args = ffmpeg::trimArgs({{QStringLiteral("in.mp4"), 0.0, 1.0, true}},
+                                              QStringLiteral("out.mp4"), 1920, 1080, 0, voiceovers);
+    // Inputs after the segments, delayed to where they start, mixed over the
+    // soundtrack at full volume and cut off where it ends.
+    QCOMPARE(args.mid(args.indexOf(QStringLiteral("vo1.flac")) - 1, 4),
+             (QStringList{"-i", "vo1.flac", "-i", "vo2.flac"}));
+    QCOMPARE(filterGraph(args),
+             QStringLiteral("[0:V:0][0:a:0]concat=n=1:v=1:a=1[joined][a];"
+                            "[joined]crop=trunc(iw/2)*2:trunc(ih/2)*2:0:0[v];"
+                            "[1:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,adelay=1500:all=1[vo0];"
+                            "[2:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,adelay=0:all=1[vo1];"
+                            "[a][vo0][vo1]amix=inputs=3:duration=first:normalize=0[mix]"));
+    QCOMPARE(args.value(args.lastIndexOf(QStringLiteral("-map")) + 1), QStringLiteral("[mix]"));
+
+    // A silent video gets silence to mix the voiceover into.
+    const QStringList silent = ffmpeg::trimArgs({{QStringLiteral("in.mp4"), 0.0, 1.0, false}},
+                                                QStringLiteral("out.mp4"), 1920, 1080, 0,
+                                                {{QStringLiteral("vo.flac"), 0.0}});
+    QVERIFY(filterGraph(silent).startsWith(
+        QStringLiteral("anullsrc=r=48000:cl=stereo,atrim=duration=1.000,aformat=sample_fmts=fltp[a0];"
+                       "[0:V:0][a0]concat=n=1:v=1:a=1[joined][a];")));
+    QVERIFY(silent.contains(QStringLiteral("aac")));
 }
 
 void BackendTests::exportHeightsNeverUpscale() {

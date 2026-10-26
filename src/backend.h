@@ -78,9 +78,19 @@ public:
     // frameFailed says how it went.
     Q_INVOKABLE void saveFrame(double t);
 
-    // Write the clips to dst. A non-zero scaleHeight downscales the shorter
-    // side to that size.
-    void exportClips(const QUrl &dst, const edit::Clips &clips, int scaleHeight = 0);
+    // Where the next voiceover is recorded: a "<name>-voiceover.flac" no
+    // file has taken yet, beside the first video. Takes stay there, so none
+    // is lost to a crash or a removal that's undone later.
+    Q_INVOKABLE QUrl voiceoverUrl() const;
+    // Lays a finished recording over the edit from t, sequence seconds,
+    // once its length is read in the background; voiceoverFailed says why
+    // when it can't be.
+    Q_INVOKABLE void addVoiceover(const QUrl &url, double t);
+
+    // Write the clips, with the voiceovers over them, to dst. A non-zero
+    // scaleHeight downscales the shorter side to that size.
+    void exportClips(const QUrl &dst, const edit::Clips &clips, int scaleHeight = 0,
+                     const edit::Voiceovers &voiceovers = {});
 
     // The downscale heights worth offering for a source: only ones strictly
     // below the source's shorter side, so exports never upscale.
@@ -96,6 +106,7 @@ signals:
     void exportFailed(const QString &message);
     void frameSaved(const QString &path);
     void frameFailed(const QString &message);
+    void voiceoverFailed(const QString &message);
     void loadError(const QString &message);
     // An addVideos batch settled with some videos loaded and this many
     // skipped, so the UI can summarize instead of stacking errors.
@@ -149,6 +160,7 @@ private:
     bool m_adding = false;
     double m_addAt = 0.0;
     edit::Clips m_exportDialogClips;
+    edit::Voiceovers m_exportDialogVoiceovers;
     bool m_busy = false;
     bool m_probing = false;
     QList<PendingVideo> m_probeQueue;

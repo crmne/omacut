@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QList>
+#include <QString>
 
 // What gets exported: an ordered list of clips, each a stretch of one of the
 // loaded videos, played back to back. The videos are never modified; a clip's
@@ -17,6 +18,19 @@ struct Clip {
     }
 };
 using Clips = QList<Clip>;
+
+// A recording laid over the edit from `at` seconds along it, heard on top
+// of whatever the clips sound like there.
+struct Voiceover {
+    QString path;
+    double at = 0.0;
+    double length = 0.0;
+    double end() const { return at + length; }
+    bool operator==(const Voiceover &other) const {
+        return path == other.path && at == other.at && length == other.length;
+    }
+};
+using Voiceovers = QList<Voiceover>;
 
 constexpr double minimumClip = 0.1;
 

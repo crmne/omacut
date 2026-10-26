@@ -259,9 +259,32 @@ QStringList frameArgs(const QString &path, double frameTime, double keyframeTime
     };
 }
 
+double audioDuration(const QString &path) {
+    const QString ffprobe = toolPath("ffprobe");
+    if (ffprobe.isEmpty())
+        return 0.0;
+    QProcess proc;
+    proc.start(ffprobe, {
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path,
+    });
+    if (!proc.waitForFinished(kProbeTimeoutMs)) {
+        proc.kill();
+        proc.waitForFinished(-1);
+        return 0.0;
+    }
+    if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0)
+        return 0.0;
+    return qMax(QString::fromUtf8(proc.readAllStandardOutput()).trimmed().toDouble(), 0.0);
+}
+
 QStringList trimArgs(const QList<Segment> &segments, const QString &dst,
-                     int width, int height, int scaleHeight) {
-    bool audio = false;
+                     int width, int height, int scaleHeight,
+                     const QList<Voiceover> &voiceovers) {
+    // A voiceover needs a soundtrack to be mixed into, silent or not.
+    bool audio = !voiceovers.isEmpty();
     bool mixed = false;
     for (const Segment &segment : segments) {
         audio = audio || segment.audio;
@@ -281,8 +304,16 @@ QStringList trimArgs(const QList<Segment> &segments, const QString &dst,
         const QString length = QString::number(qMax(segment.end - segment.start, 0.0), 'f', 3);
         args << "-ss" << QString::number(segment.start, 'f', 3) << "-t" << length
              << "-i" << segment.path;
+        const QString silence = QString("anullsrc=r=48000:cl=stereo,atrim=duration=%2,aformat=sample_fmts=fltp[a%1];")
+                                    .arg(i).arg(length);
         if (!mixed) {
-            inputs += QString("[%1:V:0]").arg(i) + (audio ? QString("[%1:a:0]").arg(i) : QString());
+            inputs += QString("[%1:V:0]").arg(i);
+            if (segment.audio) {
+                inputs += QString("[%1:a:0]").arg(i);
+            } else if (audio) {
+                graph += silence;
+                inputs += QString("[a%1]").arg(i);
+            }
             continue;
         }
         // Concat needs one frame size and one audio format throughout. Pixels
@@ -295,8 +326,7 @@ QStringList trimArgs(const QList<Segment> &segments, const QString &dst,
         if (segment.audio)
             graph += QString("[%1:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a%1];").arg(i);
         else if (audio)
-            graph += QString("anullsrc=r=48000:cl=stereo,atrim=duration=%2,aformat=sample_fmts=fltp[a%1];")
-                         .arg(i).arg(length);
+            graph += silence;
         inputs += QString("[v%1]").arg(i) + (audio ? QString("[a%1]").arg(i) : QString());
     }
     graph += inputs + QString("concat=n=%1:v=1:a=%2").arg(segments.size()).arg(audio ? 1 : 0);
@@ -313,9 +343,24 @@ QStringList trimArgs(const QList<Segment> &segments, const QString &dst,
                      .arg(audio ? "[a]" : "");
     else
         graph += QString("[v]") + (audio ? "[a]" : "");
+    // Each voiceover is its own input after the segments, delayed to where it
+    // starts and mixed in. The joined soundtrack comes first, so the mix ends
+    // with it; normalize=0 keeps every track at its own volume.
+    QString mix = "[a]";
+    for (int i = 0; i < voiceovers.size(); ++i) {
+        const int input = segments.size() + i;
+        args << "-i" << voiceovers[i].path;
+        graph += QString(";[%1:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                         "adelay=%2:all=1[vo%3]")
+                     .arg(input).arg(qRound(qMax(voiceovers[i].at, 0.0) * 1000)).arg(i);
+        mix += QString("[vo%1]").arg(i);
+    }
+    if (!voiceovers.isEmpty())
+        graph += QString(";%1amix=inputs=%2:duration=first:normalize=0[mix]")
+                     .arg(mix).arg(voiceovers.size() + 1);
     args << "-filter_complex" << graph << "-map" << "[v]";
     if (audio)
-        args << "-map" << "[a]" << "-c:a" << "aac";
+        args << "-map" << (voiceovers.isEmpty() ? "[a]" : "[mix]") << "-c:a" << "aac";
     // +faststart puts the moov atom up front so shared clips start playing
     // before they finish downloading; yuv420p keeps RGB/4:4:4/10-bit sources
     // playable everywhere.

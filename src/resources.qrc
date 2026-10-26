@@ -2,6 +2,7 @@
     <qresource prefix="/">
         <file alias="Main.qml">Main.qml</file>
         <file alias="EditBar.qml">EditBar.qml</file>
+        <file alias="VoiceoverLane.qml">VoiceoverLane.qml</file>
         <file alias="Format.js">Format.js</file>
     </qresource>
 </RCC>

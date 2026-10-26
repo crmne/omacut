@@ -60,14 +60,26 @@ struct Segment {
     bool audio = false;
 };
 
+// A recording heard from `at` seconds into the export, over the segments.
+struct Voiceover {
+    QString path;
+    double at = 0.0;
+};
+
 // Build the ffmpeg argument list that writes the segments, back to back, to
 // dst. Cuts are frame-accurate and re-encoded with libx264/aac. Segments from
 // different videos are fitted into width x height, letterboxed, with silence
 // for any without audio. A non-zero scaleHeight downscales so the shorter
 // side becomes scaleHeight (1080p of a portrait video is 1080 wide), always
-// preserving the aspect ratio.
+// preserving the aspect ratio. Voiceovers are mixed in at full volume, and
+// cut off where the segments end.
 QStringList trimArgs(const QList<Segment> &segments, const QString &dst,
-                     int width, int height, int scaleHeight = 0);
+                     int width, int height, int scaleHeight = 0,
+                     const QList<Voiceover> &voiceovers = {});
+
+// The length of an audio file in seconds (runs ffprobe), or 0 when it can't
+// be read.
+double audioDuration(const QString &path);
 
 // Locate a tool on PATH; returns empty string if missing.
 QString toolPath(const QString &tool);

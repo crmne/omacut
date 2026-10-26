@@ -23,6 +23,11 @@ ApplicationWindow {
     property bool helpVisible: false
     property bool quitConfirmVisible: false
     property bool openConfirmVisible: false
+    // The capture session of the voiceover being recorded, from the press of
+    // record until its file is written, and where along the edit it began.
+    property var recordSession: null
+    readonly property bool recording: recordSession !== null
+    property real recordFrom: -1
     readonly property string statusText: noticeText !== "" ? noticeText : backend.status
 
     readonly property var timeline: backend.timeline
@@ -30,8 +35,9 @@ ApplicationWindow {
     // first video is never dirty — that's just the source.
     readonly property bool unexported: hasVideo && timeline.unexported
     // Editing shortcuts go quiet while a dialog or the help overlay is up,
-    // a probe is about to replace the timeline, or a handle is dragged.
-    readonly property bool editing: hasVideo && timeline.duration > 0 && !quitConfirmVisible && !openConfirmVisible && !helpVisible && !backend.probing && !editBar.interacting
+    // a probe is about to replace the timeline, a handle is dragged, or a
+    // voiceover is being recorded.
+    readonly property bool editing: hasVideo && timeline.duration > 0 && !quitConfirmVisible && !openConfirmVisible && !helpVisible && !backend.probing && !editBar.interacting && !recording
 
     Material.theme: Material.Dark
     Material.accent: win.accent
@@ -124,8 +130,80 @@ ApplicationWindow {
         timeline.moveClip(i, i + direction);
         seekTo(timeline.clipStart(i + direction) + into);
     }
+    // Records a voiceover from the playhead (from the top once at the end)
+    // while the edit plays, muted so it doesn't end up in the take, until
+    // stopped or the edit ends. Playback waits for the microphone, so the
+    // take lines up with what was on screen.
+    function startRecording() {
+        if (!win.editing || backend.busy)
+            return;
+        var url = backend.voiceoverUrl();
+        if (url.toString() === "")
+            return;
+        player.pause();
+        recordFrom = editBar.playheadSec >= timeline.duration - 0.03 ? 0 : editBar.playheadSec;
+        seekTo(recordFrom);
+        recordSession = recorderComponent.createObject(win);
+        recordSession.recorder.outputLocation = url;
+        recordSession.recorder.record();
+    }
+    function stopRecording() {
+        if (recordSession === null)
+            return;
+        if (recordSession.recorder.recorderState === MediaRecorder.StoppedState)
+            recordingStopped("");
+        else
+            recordSession.recorder.stop();
+    }
+    function recordingStarted() {
+        ensureAudioOutput();
+        var i = timeline.clipAt(recordFrom), clip = timeline.clips[i];
+        player.show(i, clip.in + recordFrom - clip.start, true);
+    }
+    // The take is written to url, or empty when there's nothing to keep.
+    function recordingStopped(url) {
+        var session = recordSession;
+        if (session === null)
+            return;
+        recordSession = null;
+        player.pause();
+        if (url.toString() !== "")
+            backend.addVoiceover(url, recordFrom);
+        recordFrom = -1;
+        session.destroy();
+    }
+    // Plays each voiceover under the playhead along with the edit, nudging
+    // any that drift from it.
+    function syncVoiceovers() {
+        var on = playing() && !recording, t = editBar.playheadSec;
+        for (var i = 0; i < voiceoverPlayers.count; ++i) {
+            var vo = voiceoverPlayers.objectAt(i);
+            if (!vo || !vo.voiceover)
+                continue;
+            if (!on || t < vo.voiceover.at || t >= vo.voiceover.end) {
+                if (vo.playbackState === MediaPlayer.PlayingState)
+                    vo.pause();
+                continue;
+            }
+            var ms = Math.round((t - vo.voiceover.at) * 1000);
+            if (vo.playbackState !== MediaPlayer.PlayingState) {
+                vo.position = ms;
+                vo.play();
+            } else if (Math.abs(vo.position - ms) > 250) {
+                vo.position = ms;
+            }
+        }
+    }
+    onRecordingChanged: syncVoiceovers()
+
     property bool quitting: false
     function requestQuit() {
+        // The take first: once it's laid over the edit, quitting can ask
+        // about it like any other edit.
+        if (recording) {
+            stopRecording();
+            return;
+        }
         if (unexported) {
             if (player.playbackState === MediaPlayer.PlayingState)
                 player.pause();
@@ -157,6 +235,11 @@ ApplicationWindow {
     onClosing: (close) => {
         if (win.quitting)
             return;
+        if (win.recording) {
+            close.accepted = false;
+            win.stopRecording();
+            return;
+        }
         // A close with the open confirmation up just puts it away, rather
         // than stacking the quit confirmation on top of it.
         if (win.openConfirmVisible) {
@@ -195,7 +278,15 @@ ApplicationWindow {
         sequence: "Space"
         context: Qt.ApplicationShortcut
         enabled: win.hasVideo && !win.quitConfirmVisible && !win.openConfirmVisible && !win.helpVisible
-        onActivated: togglePlay()
+        onActivated: win.recording ? stopRecording() : togglePlay()
+    }
+
+    Shortcut {
+        sequence: "R"
+        context: Qt.ApplicationShortcut
+        autoRepeat: false
+        enabled: win.recording || (win.editing && !backend.busy)
+        onActivated: win.recording ? stopRecording() : startRecording()
     }
 
     Shortcut {
@@ -339,7 +430,7 @@ ApplicationWindow {
     Shortcut {
         sequence: "Ctrl+S"
         context: Qt.ApplicationShortcut
-        enabled: win.hasVideo && timeline.duration > 0 && !backend.busy && !win.helpVisible && !win.openConfirmVisible
+        enabled: win.hasVideo && timeline.duration > 0 && !backend.busy && !win.helpVisible && !win.openConfirmVisible && !win.recording
         onActivated: {
             win.quitConfirmVisible = false;
             exportVideo();
@@ -349,7 +440,7 @@ ApplicationWindow {
     Shortcut {
         sequence: "Ctrl+O"
         context: Qt.ApplicationShortcut
-        enabled: !win.quitConfirmVisible && !win.openConfirmVisible && !win.helpVisible && !backend.busy
+        enabled: !win.quitConfirmVisible && !win.openConfirmVisible && !win.helpVisible && !backend.busy && !win.recording
         onActivated: openVideo()
     }
 
@@ -382,7 +473,9 @@ ApplicationWindow {
         sequence: "Escape"
         context: Qt.ApplicationShortcut
         onActivated: {
-            if (win.quitConfirmVisible)
+            if (win.recording)
+                stopRecording();
+            else if (win.quitConfirmVisible)
                 win.quitConfirmVisible = false;
             else if (win.openConfirmVisible)
                 win.openConfirmVisible = false;
@@ -483,6 +576,8 @@ ApplicationWindow {
                 startPriming(ms);
             }
         }
+        onPlaybackStateChanged: win.syncVoiceovers()
+        onPrimingChanged: win.syncVoiceovers()
         onPositionChanged: {
             if (priming) {
                 if (player.position > primeMs)
@@ -498,6 +593,7 @@ ApplicationWindow {
                 if (clip + 1 >= timeline.clips.length) {
                     pause();
                     editBar.playheadSec = timeline.duration;
+                    win.stopRecording();
                     return;
                 }
                 var next = timeline.clips[clip + 1];
@@ -551,7 +647,61 @@ ApplicationWindow {
             // output, so nothing watches devices before a video is open.
             property MediaDevices devices: MediaDevices {}
             device: devices.defaultAudioOutput
-            muted: player.priming
+            muted: player.priming || win.recording
+        }
+    }
+
+    // One player per voiceover, kept in step with the edit by syncVoiceovers.
+    Instantiator {
+        id: voiceoverPlayers
+        model: win.hasVideo ? win.timeline.voiceovers.length : 0
+        delegate: MediaPlayer {
+            required property int index
+            readonly property var voiceover: win.timeline.voiceovers[index]
+            source: voiceover ? voiceover.url : ""
+            audioOutput: AudioOutput {
+                property MediaDevices devices: MediaDevices {}
+                device: devices.defaultAudioOutput
+            }
+        }
+    }
+    Connections {
+        target: editBar
+        function onPlayheadSecChanged() {
+            win.syncVoiceovers();
+        }
+    }
+
+    // Made for each take and destroyed after it, so the microphone is only
+    // open while recording.
+    Component {
+        id: recorderComponent
+        CaptureSession {
+            audioInput: AudioInput {
+                property MediaDevices devices: MediaDevices {}
+                device: devices.defaultAudioInput
+            }
+            recorder: MediaRecorder {
+                property bool started: false
+                property bool failed: false
+                mediaFormat {
+                    fileFormat: MediaFormat.FLAC
+                    audioCodec: MediaFormat.AudioCodec.FLAC
+                }
+                onRecorderStateChanged: {
+                    if (recorderState === MediaRecorder.RecordingState) {
+                        started = true;
+                        win.recordingStarted();
+                    } else if (recorderState === MediaRecorder.StoppedState) {
+                        win.recordingStopped(started && !failed ? actualLocation : "");
+                    }
+                }
+                onErrorOccurred: (error, errorString) => {
+                    failed = true;
+                    win.showNotice("Could not record: " + errorString);
+                    win.recordingStopped("");
+                }
+            }
         }
     }
 
@@ -645,6 +795,20 @@ ApplicationWindow {
                     ctx.lineTo(8, 19);
                     ctx.lineTo(19, 12);
                     ctx.closePath();
+                    ctx.fill();
+                } else if (iconButton.iconName === "mic") {
+                    ctx.beginPath();
+                    ctx.roundedRect(9, 3, 6, 11, 3, 3);
+                    ctx.fill();
+
+                    ctx.beginPath();
+                    ctx.arc(12, 11, 6, 0, Math.PI, false);
+                    ctx.moveTo(12, 17);
+                    ctx.lineTo(12, 21);
+                    ctx.stroke();
+                } else if (iconButton.iconName === "stop") {
+                    ctx.beginPath();
+                    ctx.roundedRect(7, 7, 10, 10, 2, 2);
                     ctx.fill();
                 } else if (iconButton.iconName === "plus") {
                     ctx.beginPath();
@@ -775,23 +939,55 @@ ApplicationWindow {
                 onClicked: togglePlay()
             }
 
-            EditBar {
-                id: editBar
-                objectName: "editBar"
+            ColumnLayout {
                 Layout.fillWidth: true
-                // Frozen while a probe is in flight: it is about to replace
-                // or extend the timeline the bar is showing.
-                enabled: !backend.probing
-                accent: win.accent
-                accentForeground: win.accentForeground
-                onScrub: (seconds) => {
-                    player.pause();
-                    seekTo(seconds);
+                spacing: 6
+
+                EditBar {
+                    id: editBar
+                    objectName: "editBar"
+                    Layout.fillWidth: true
+                    // Frozen while a probe is in flight: it is about to replace
+                    // or extend the timeline the bar is showing. Frozen while
+                    // recording too, as the take follows the playhead.
+                    enabled: !backend.probing && !win.recording
+                    accent: win.accent
+                    accentForeground: win.accentForeground
+                    onScrub: (seconds) => {
+                        player.pause();
+                        seekTo(seconds);
+                    }
+                    onScrubClip: (index, sourceTime) => {
+                        player.pause();
+                        player.show(index, sourceTime, false);
+                    }
                 }
-                onScrubClip: (index, sourceTime) => {
-                    player.pause();
-                    player.show(index, sourceTime, false);
+
+                VoiceoverLane {
+                    objectName: "voiceoverLane"
+                    Layout.fillWidth: true
+                    visible: timeline.voiceovers.length > 0 || win.recording
+                    enabled: !backend.probing && !win.recording
+                    bar: editBar
+                    accent: win.accent
+                    accentForeground: win.accentForeground
+                    recordingFrom: win.recordFrom
+                    onSeek: (seconds) => {
+                        player.pause();
+                        seekTo(seconds);
+                    }
                 }
+            }
+
+            IconButton {
+                objectName: "recordButton"
+                Layout.preferredWidth: 44
+                Layout.preferredHeight: 44
+                iconName: win.recording ? "stop" : "mic"
+                buttonColor: win.recording ? "#ff453a" : "#2c2c2f"
+                tipText: win.recording ? "Stop recording" : "Record a voiceover"
+                enabled: win.recording || (timeline.duration > 0 && !backend.busy)
+                onClicked: win.recording ? stopRecording() : startRecording()
             }
 
             IconButton {
@@ -799,7 +995,7 @@ ApplicationWindow {
                 Layout.preferredHeight: 44
                 iconName: "plus"
                 tipText: "Add a video"
-                enabled: timeline.duration > 0 && !backend.busy
+                enabled: timeline.duration > 0 && !backend.busy && !win.recording
                 onClicked: addVideo()
             }
 
@@ -808,7 +1004,7 @@ ApplicationWindow {
                 Layout.preferredHeight: 44
                 iconName: "download"
                 tipText: "Export"
-                enabled: timeline.duration > 0 && !backend.busy
+                enabled: timeline.duration > 0 && !backend.busy && !win.recording
                 onClicked: exportVideo()
             }
         }
@@ -838,7 +1034,8 @@ ApplicationWindow {
                 anchors.centerIn: parent
                 visible: win.statusText === "" && timeline.duration > 0 && !editBar.trimming
                 textFormat: Text.StyledText
-                text: Format.fmt(editBar.playheadSec) + " (" + Format.fmt(win.timeline.duration) + ")"
+                text: (win.recording ? "<font color=\"#ff453a\">● REC</font>  " : "")
+                    + Format.fmt(editBar.playheadSec) + " (" + Format.fmt(win.timeline.duration) + ")"
                     + (editBar.zoomed ? " · <font color=\"" + win.accent + "\">zoomed</font>" : "")
                 color: "#d6d6da"
                 font.pixelSize: 13
@@ -852,7 +1049,7 @@ ApplicationWindow {
         objectName: "videoDropArea"
         anchors.fill: parent
         z: 5
-        enabled: !win.quitConfirmVisible && !win.openConfirmVisible && !win.helpVisible && !backend.busy
+        enabled: !win.quitConfirmVisible && !win.openConfirmVisible && !win.helpVisible && !backend.busy && !win.recording
         // Only local files: "file:-report" or "file:http://..." would reach
         // ffprobe as an option or an address, and "file:////host/..." is a
         // network share.
@@ -956,6 +1153,7 @@ ApplicationWindow {
                         { keys: "Ctrl Z", action: "Undo (Ctrl Shift Z redo)" },
                         { keys: "Z", action: "Zoom to the clip" },
                         { keys: "F", action: "Save the playhead frame as a PNG" },
+                        { keys: "R", action: "Record a voiceover from the playhead" },
                         { keys: "Ctrl O", action: "Open a video" },
                         { keys: "Ctrl Shift O", action: "Add a video after this clip" },
                         { keys: "Ctrl S", action: "Export" },
@@ -1171,6 +1369,9 @@ ApplicationWindow {
         }
         function onFrameFailed(message) {
             win.showNotice("Could not save the frame: " + message);
+        }
+        function onVoiceoverFailed(message) {
+            win.showNotice("Could not add the voiceover: " + message);
         }
         function onLoadError(message) {
             // The export-reopen refusal is a complete sentence already.

@@ -87,7 +87,7 @@ void Backend::wireFilePicker() {
             load(url);
     });
     connect(m_filePicker, &FilePicker::exportSelected, this, [this](const QUrl &url, int scaleHeight) {
-        exportClips(url, m_exportDialogClips, scaleHeight);
+        exportClips(url, m_exportDialogClips, scaleHeight, m_exportDialogVoiceovers);
     });
     connect(m_filePicker, &FilePicker::failed, this, &Backend::loadError);
 }
@@ -369,6 +369,7 @@ void Backend::exportDialog() {
         return;
 
     m_exportDialogClips = m_timeline.clips();
+    m_exportDialogVoiceovers = m_timeline.voiceovers();
     const ffmpeg::VideoInfo &frame = m_videos.value(m_exportDialogClips.value(0).source).info;
     m_filePicker->exportVideo(suggestedExportUrl(), exportHeights(frame.width, frame.height));
 }
@@ -442,6 +443,38 @@ void Backend::saveFrame(double t) {
     });
 }
 
+QUrl Backend::voiceoverUrl() const {
+    if (m_videos.isEmpty())
+        return {};
+    const QFileInfo source(m_videos.first().info.path);
+    const QString stem = source.absolutePath() + QLatin1Char('/') + source.completeBaseName();
+    QString path = stem + QStringLiteral("-voiceover.flac");
+    for (int n = 2; QFileInfo::exists(path); ++n)
+        path = stem + QStringLiteral("-voiceover-%1.flac").arg(n);
+    return QUrl::fromLocalFile(path);
+}
+
+void Backend::addVoiceover(const QUrl &url, double t) {
+    const QString path = url.toLocalFile();
+    const QUrl source = this->source();
+    if (path.isEmpty() || source.isEmpty())
+        return;
+    // Like a video probe, off the UI thread, and dropped if the backend is
+    // gone or another video was opened meanwhile.
+    const QPointer<Backend> guard(this);
+    QThreadPool::globalInstance()->start([guard, path, source, t] {
+        const double length = ffmpeg::audioDuration(path);
+        QMetaObject::invokeMethod(QCoreApplication::instance(), [guard, path, source, t, length] {
+            if (!guard || guard->source() != source)
+                return;
+            if (length <= 0.0)
+                emit guard->voiceoverFailed(QStringLiteral("Nothing was recorded."));
+            else
+                guard->m_timeline.addVoiceover(path, t, length);
+        }, Qt::QueuedConnection);
+    });
+}
+
 void Backend::runFrameStep(const QString &program, const QStringList &args,
                            std::function<void(const QByteArray &)> done, const QString &partPath) {
     auto *proc = new QProcess(this);
@@ -493,7 +526,8 @@ QUrl Backend::suggestedExportUrl() const {
     return QUrl::fromLocalFile(target);
 }
 
-void Backend::exportClips(const QUrl &dst, const edit::Clips &clips, int scaleHeight) {
+void Backend::exportClips(const QUrl &dst, const edit::Clips &clips, int scaleHeight,
+                          const edit::Voiceovers &voiceovers) {
     if (m_videos.isEmpty() || busy())
         return;
 
@@ -539,7 +573,11 @@ void Backend::exportClips(const QUrl &dst, const edit::Clips &clips, int scaleHe
     const QString tmpPath = outPath + QStringLiteral(".omacut-part.mp4");
     QFile::remove(tmpPath);
     const ffmpeg::VideoInfo &frame = m_videos[frameSource].info;
-    const QStringList args = ffmpeg::trimArgs(segments, tmpPath, frame.width, frame.height, scaleHeight);
+    QList<ffmpeg::Voiceover> overlays;
+    for (const edit::Voiceover &voiceover : voiceovers)
+        overlays.append({voiceover.path, voiceover.at});
+    const QStringList args = ffmpeg::trimArgs(segments, tmpPath, frame.width, frame.height,
+                                              scaleHeight, overlays);
 
     auto *proc = new QProcess(this);
     auto completed = std::make_shared<bool>(false);
@@ -566,7 +604,7 @@ void Backend::exportClips(const QUrl &dst, const edit::Clips &clips, int scaleHe
             });
 
     connect(proc, &QProcess::finished, this,
-            [this, proc, outPath, tmpPath, completed, clips](int code, QProcess::ExitStatus exitStatus) {
+            [this, proc, outPath, tmpPath, completed, clips, voiceovers](int code, QProcess::ExitStatus exitStatus) {
                 if (*completed)
                     return;
                 *completed = true;
@@ -587,7 +625,7 @@ void Backend::exportClips(const QUrl &dst, const edit::Clips &clips, int scaleHe
                 // The reopen probes in the background; if it fails, the probe
                 // result says the saved file couldn't be reopened.
                 if (!isVideoPath(outPath)) {
-                    m_timeline.markExported(clips);
+                    m_timeline.markExported(clips, voiceovers);
                     emit exportDone(outPath);
                 } else {
                     // exportDone waits for the reopen probe to settle.
